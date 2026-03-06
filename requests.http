@@ -1,0 +1,12 @@
+### Health check
+GET http://127.0.0.1:8080/
+
+### Register user
+POST http://127.0.0.1:8080/register
+Content-Type: application/json
+
+{
+  "name": "Ali",
+  "email": "ali_new_99@test.com",
+  "password": "123456"
+}
