@@ -12,6 +12,12 @@ import (
 	"myapp/internal/http/router"
 )
 
+// Temporary protected wrapper so the project compiles.
+// Replace `return next` with your real JWT/auth middleware later.
+func protected(next http.Handler) http.Handler {
+	return next
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	allowed := strings.TrimSpace(os.Getenv("CORS_ALLOWED_ORIGINS"))
 	allowCreds := strings.TrimSpace(strings.ToLower(os.Getenv("CORS_ALLOW_CREDENTIALS"))) == "true"
@@ -29,10 +35,9 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 
-		// only set allow-origin if origin is in allowed list
 		if origin != "" && allowedMap[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin") // important for caching
+			w.Header().Set("Vary", "Origin")
 		}
 
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
@@ -42,7 +47,6 @@ func corsMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 
-		// Preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -61,7 +65,7 @@ func main() {
 	}
 	defer db.Close()
 
-	mux := router.New(db)
+	mux := router.SetupRouter(db, protected)
 
 	log.Println("Server started at :8080")
 	log.Fatal(http.ListenAndServe(":8080", corsMiddleware(mux)))

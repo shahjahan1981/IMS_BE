@@ -3,350 +3,424 @@ package handlers
 import (
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strings"
 
 	"myapp/internal/http/dto"
-	"myapp/internal/http/handlers/requests"
-
-	"github.com/lib/pq"
 )
 
-var allowedTicketTypes = map[string]bool{
-	"service_down":           true,
-	"high_cpu_usage":         true,
-	"memory_warning":         true,
-	"disk_space_alert":       true,
-	"network_latency":        true,
-	"ssl_certificate_expiry": true,
-	"database_connection":    true,
-	"host_unreachable":       true,
+func isValidTicketType(value string) bool {
+	allowed := map[string]bool{
+		"service_down":           true,
+		"high_cpu_usage":         true,
+		"memory_warning":         true,
+		"disk_space_alert":       true,
+		"network_latency":        true,
+		"ssl_certificate_expiry": true,
+		"database_connection":    true,
+		"host_unreachable":       true,
+	}
+	return allowed[value]
 }
 
-var allowedSeverities = map[string]bool{
-	"warning":  true,
-	"critical": true,
+func isValidTicketSeverity(value string) bool {
+	return value == "warning" || value == "critical"
 }
 
-var allowedSources = map[string]bool{
-	"email":         true,
-	"portal":        true,
-	"communication": true,
+func isValidTicketSource(value string) bool {
+	return value == "email" || value == "portal" || value == "communication"
 }
 
-// POST /ticket/create
-func CreateTicketHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func CreateTicketHandler(db *sql.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
-			apiFail(w, http.StatusMethodNotAllowed, map[string]string{"method": "invalid"})
+			apiFail(w, http.StatusMethodNotAllowed, map[string]string{
+				"method": "method not allowed",
+			})
 			return
 		}
 
-		var req requests.CreateTicketRequest
+		var req dto.CreateTicketRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			apiFail(w, http.StatusBadRequest, map[string]string{"body": "invalid"})
+			apiFail(w, http.StatusBadRequest, map[string]string{
+				"body": "invalid json body",
+			})
 			return
 		}
 
-		// normalize
-		req.TicketID = strings.TrimSpace(req.TicketID)
-		req.Title = strings.TrimSpace(req.Title)
-		req.Type = strings.TrimSpace(strings.ToLower(req.Type))
-		req.Severity = strings.TrimSpace(strings.ToLower(req.Severity))
-		req.Source = strings.TrimSpace(strings.ToLower(req.Source))
-		req.DetailedDesc = strings.TrimSpace(req.DetailedDesc)
+		errors := map[string]string{}
 
-		// required validations (property-only)
-		errs := map[string]string{}
-		if req.TicketID == "" {
-			errs["ticket_id"] = "required"
+		if strings.TrimSpace(req.TicketID) == "" {
+			errors["ticket_id"] = "ticket_id is required"
 		}
-		if req.Title == "" {
-			errs["title"] = "required"
+		if strings.TrimSpace(req.Title) == "" {
+			errors["title"] = "title is required"
 		}
-		if req.Type == "" {
-			errs["type"] = "required"
+		if !isValidTicketType(req.Type) {
+			errors["type"] = "invalid type"
 		}
-		if req.Severity == "" {
-			errs["severity"] = "required"
+		if !isValidTicketSeverity(req.Severity) {
+			errors["severity"] = "invalid severity"
 		}
-		if req.Source == "" {
-			errs["source"] = "required"
+		if !isValidTicketSource(req.Source) {
+			errors["source"] = "invalid source"
+		}
+		if strings.TrimSpace(req.TicketTimeIn) == "" {
+			errors["ticket_time_in"] = "ticket_time_in is required"
+		}
+		if strings.TrimSpace(req.FirstResponseAt) == "" {
+			errors["first_response_at"] = "first_response_at is required"
+		}
+		if strings.TrimSpace(req.TicketTimeOut) == "" {
+			errors["ticket_time_out"] = "ticket_time_out is required"
+		}
+		if strings.TrimSpace(req.DetailedDescription) == "" {
+			errors["detailed_description"] = "detailed_description is required"
 		}
 		if req.CreatedByUserID <= 0 {
-			errs["created_by_user_id"] = "required"
+			errors["created_by_user_id"] = "created_by_user_id is required"
 		}
-		if len(errs) > 0 {
-			apiFail(w, http.StatusBadRequest, errs)
+		if req.HandledByUserID <= 0 {
+			errors["handled_by_user_id"] = "handled_by_user_id is required"
+		}
+
+		if len(errors) > 0 {
+			apiFail(w, http.StatusBadRequest, errors)
 			return
 		}
 
-		// title length (DB is varchar(30))
-		if len(req.Title) > 30 {
-			apiFail(w, http.StatusBadRequest, map[string]string{"title": "max_length"})
-			return
-		}
+		query := `
+			INSERT INTO tickets (
+				ticket_id,
+				title,
+				type,
+				severity,
+				source,
+				is_escalated,
+				auto_resolved,
+				detailed_description,
+				created_by_user_id,
+				handled_by_user_id,
+				ticket_time_in,
+				first_response_at,
+				ticket_time_out,
+				created_at,
+				updated_at
+			)
+			VALUES (
+				$1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+				date_trunc('day', CURRENT_TIMESTAMP) + $11::time,
+				date_trunc('day', CURRENT_TIMESTAMP) + $12::time,
+				date_trunc('day', CURRENT_TIMESTAMP) + $13::time,
+				NOW(),
+				NOW()
+			)
+			RETURNING
+				id,
+				ticket_id,
+				title,
+				type,
+				severity,
+				source,
+				is_escalated,
+				auto_resolved,
+				detailed_description,
+				created_by_user_id,
+				handled_by_user_id,
+				ticket_time_in,
+				first_response_at,
+				ticket_time_out,
+				created_at,
+				updated_at
+		`
 
-		// allowed values
-		if !allowedTicketTypes[req.Type] {
-			apiFail(w, http.StatusBadRequest, map[string]string{"type": "invalid"})
-			return
-		}
-		if !allowedSeverities[req.Severity] {
-			apiFail(w, http.StatusBadRequest, map[string]string{"severity": "invalid"})
-			return
-		}
-		if !allowedSources[req.Source] {
-			apiFail(w, http.StatusBadRequest, map[string]string{"source": "invalid"})
-			return
-		}
+		var ticket dto.TicketResponse
 
-		var detail any = nil
-		if req.DetailedDesc != "" {
-			detail = req.DetailedDesc
-		}
-
-		var handled any = nil
-		if req.HandledByUserID != nil && *req.HandledByUserID > 0 {
-			handled = *req.HandledByUserID
-		}
-
-		// insert
-		var newID int64
-		err := db.QueryRow(`
-			INSERT INTO tickets
-				(ticket_id, title, type, severity, source, is_escalated, auto_resolved, detailed_description, created_by_user_id, handled_by_user_id)
-			VALUES
-				($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-			RETURNING id
-		`,
-			req.TicketID, req.Title, req.Type, req.Severity, req.Source,
-			req.IsEscalated, req.AutoResolved, detail, req.CreatedByUserID, handled,
-		).Scan(&newID)
-
+		err := db.QueryRow(
+			query,
+			req.TicketID,
+			req.Title,
+			req.Type,
+			req.Severity,
+			req.Source,
+			req.IsEscalated,
+			req.AutoResolved,
+			req.DetailedDescription,
+			req.CreatedByUserID,
+			req.HandledByUserID,
+			req.TicketTimeIn,
+			req.FirstResponseAt,
+			req.TicketTimeOut,
+		).Scan(
+			&ticket.ID,
+			&ticket.TicketID,
+			&ticket.Title,
+			&ticket.Type,
+			&ticket.Severity,
+			&ticket.Source,
+			&ticket.IsEscalated,
+			&ticket.AutoResolved,
+			&ticket.DetailedDescription,
+			&ticket.CreatedByUserID,
+			&ticket.HandledByUserID,
+			&ticket.TicketTimeIn,
+			&ticket.FirstResponseAt,
+			&ticket.TicketTimeOut,
+			&ticket.CreatedAt,
+			&ticket.UpdatedAt,
+		)
 		if err != nil {
-			var pqErr *pq.Error
-			if errors.As(err, &pqErr) {
-				// unique violation
-				if pqErr.Code == "23505" {
-					c := strings.ToLower(pqErr.Constraint + " " + pqErr.Detail)
-					if strings.Contains(c, "ticket_id") {
-						apiFail(w, http.StatusConflict, map[string]string{"ticket_id": "exists"})
-						return
-					}
-					apiFail(w, http.StatusConflict, map[string]string{"general": "exists"})
-					return
-				}
-				// fk violation
-				if pqErr.Code == "23503" {
-					c := strings.ToLower(pqErr.Constraint + " " + pqErr.Detail)
-					if strings.Contains(c, "created_by") {
-						apiFail(w, http.StatusBadRequest, map[string]string{"created_by_user_id": "invalid"})
-						return
-					}
-					if strings.Contains(c, "handled_by") {
-						apiFail(w, http.StatusBadRequest, map[string]string{"handled_by_user_id": "invalid"})
-						return
-					}
-					apiFail(w, http.StatusBadRequest, map[string]string{"general": "invalid"})
-					return
-				}
-			}
-
-			apiFail(w, http.StatusInternalServerError, map[string]string{"general": "invalid"})
+			apiFail(w, http.StatusInternalServerError, map[string]string{
+				"database": err.Error(),
+			})
 			return
 		}
 
-		// success (no ticket data)
 		apiOK(w, map[string]any{
-			"successfully_created": true,
-			"id":                   newID,
-			"ticket_id":            req.TicketID,
+			"ticket": ticket,
 		})
-	}
+	})
 }
 
-// GET /tickets/list
-func ListTicketsHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func ListTicketsHandler(db *sql.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			apiFail(w, http.StatusMethodNotAllowed, map[string]string{"method": "invalid"})
+			apiFail(w, http.StatusMethodNotAllowed, map[string]string{
+				"method": "method not allowed",
+			})
 			return
 		}
 
-		rows, err := db.Query(`
-			SELECT id, ticket_id, title, type, severity, source,
-			       is_escalated, auto_resolved, detailed_description,
-			       created_by_user_id, handled_by_user_id,
-			       ticket_time_in, ticket_time_out, first_response_at,
-			       created_at, updated_at
+		query := `
+			SELECT
+				id,
+				ticket_id,
+				title,
+				type,
+				severity,
+				source,
+				is_escalated,
+				auto_resolved,
+				detailed_description,
+				created_by_user_id,
+				handled_by_user_id,
+				ticket_time_in,
+				first_response_at,
+				ticket_time_out,
+				created_at,
+				updated_at
 			FROM tickets
 			ORDER BY id DESC
-			LIMIT 200
-		`)
+		`
+
+		rows, err := db.Query(query)
 		if err != nil {
-			apiFail(w, http.StatusInternalServerError, map[string]string{"general": "invalid"})
+			apiFail(w, http.StatusInternalServerError, map[string]string{
+				"database": err.Error(),
+			})
 			return
 		}
 		defer rows.Close()
 
-		out := make([]dto.TicketDTO, 0)
-		for rows.Next() {
-			var t dto.TicketDTO
-			var desc sql.NullString
-			var handled sql.NullInt64
-			var tout sql.NullTime
-			var first sql.NullTime
+		var tickets []dto.TicketResponse
 
-			if err := rows.Scan(
-				&t.ID, &t.TicketID, &t.Title, &t.Type, &t.Severity, &t.Source,
-				&t.IsEscalated, &t.AutoResolved, &desc,
-				&t.CreatedByUserID, &handled,
-				&t.TicketTimeIn, &tout, &first,
-				&t.CreatedAt, &t.UpdatedAt,
-			); err != nil {
-				apiFail(w, http.StatusInternalServerError, map[string]string{"general": "invalid"})
+		for rows.Next() {
+			var t dto.TicketResponse
+
+			err := rows.Scan(
+				&t.ID,
+				&t.TicketID,
+				&t.Title,
+				&t.Type,
+				&t.Severity,
+				&t.Source,
+				&t.IsEscalated,
+				&t.AutoResolved,
+				&t.DetailedDescription,
+				&t.CreatedByUserID,
+				&t.HandledByUserID,
+				&t.TicketTimeIn,
+				&t.FirstResponseAt,
+				&t.TicketTimeOut,
+				&t.CreatedAt,
+				&t.UpdatedAt,
+			)
+			if err != nil {
+				apiFail(w, http.StatusInternalServerError, map[string]string{
+					"database": err.Error(),
+				})
 				return
 			}
 
-			if desc.Valid {
-				v := desc.String
-				t.DetailedDesc = &v
-			}
-			if handled.Valid {
-				v := handled.Int64
-				t.HandledByUserID = &v
-			}
-			if tout.Valid {
-				v := tout.Time
-				t.TicketTimeOut = &v
-			}
-			if first.Valid {
-				v := first.Time
-				t.FirstResponseAt = &v
-			}
-
-			out = append(out, t)
+			tickets = append(tickets, t)
 		}
 
-		apiOK(w, map[string]any{"tickets": out})
-	}
+		apiOK(w, map[string]any{
+			"tickets": tickets,
+		})
+	})
 }
 
-// GET /ticket/detail/{ticket_id}
-// Example: /ticket/detail/TCK-0001
-func TicketDetailByTicketIDHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func TicketDetailByTicketIDHandler(db *sql.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
-			apiFail(w, http.StatusMethodNotAllowed, map[string]string{"method": "invalid"})
+			apiFail(w, http.StatusMethodNotAllowed, map[string]string{
+				"method": "method not allowed",
+			})
 			return
 		}
 
 		ticketID := strings.TrimPrefix(r.URL.Path, "/ticket/detail/")
-		ticketID = strings.TrimSpace(ticketID)
-
-		if ticketID == "" {
-			apiFail(w, http.StatusBadRequest, map[string]string{"ticket_id": "required"})
+		if strings.TrimSpace(ticketID) == "" {
+			apiFail(w, http.StatusBadRequest, map[string]string{
+				"ticket_id": "ticket_id is required",
+			})
 			return
 		}
 
-		var (
-			t       dto.TicketDTO
-			desc    sql.NullString
-			handled sql.NullInt64
-			tout    sql.NullTime
-			first   sql.NullTime
-		)
-
-		err := db.QueryRow(`
-			SELECT id, ticket_id, title, type, severity, source,
-			       is_escalated, auto_resolved, detailed_description,
-			       created_by_user_id, handled_by_user_id,
-			       ticket_time_in, ticket_time_out, first_response_at,
-			       created_at, updated_at
+		query := `
+			SELECT
+				id,
+				ticket_id,
+				title,
+				type,
+				severity,
+				source,
+				is_escalated,
+				auto_resolved,
+				detailed_description,
+				created_by_user_id,
+				handled_by_user_id,
+				ticket_time_in,
+				first_response_at,
+				ticket_time_out,
+				created_at,
+				updated_at
 			FROM tickets
 			WHERE ticket_id = $1
-		`, ticketID).Scan(
-			&t.ID, &t.TicketID, &t.Title, &t.Type, &t.Severity, &t.Source,
-			&t.IsEscalated, &t.AutoResolved, &desc,
-			&t.CreatedByUserID, &handled,
-			&t.TicketTimeIn, &tout, &first,
-			&t.CreatedAt, &t.UpdatedAt,
+		`
+
+		var ticket dto.TicketResponse
+
+		err := db.QueryRow(query, ticketID).Scan(
+			&ticket.ID,
+			&ticket.TicketID,
+			&ticket.Title,
+			&ticket.Type,
+			&ticket.Severity,
+			&ticket.Source,
+			&ticket.IsEscalated,
+			&ticket.AutoResolved,
+			&ticket.DetailedDescription,
+			&ticket.CreatedByUserID,
+			&ticket.HandledByUserID,
+			&ticket.TicketTimeIn,
+			&ticket.FirstResponseAt,
+			&ticket.TicketTimeOut,
+			&ticket.CreatedAt,
+			&ticket.UpdatedAt,
 		)
-
-		if errors.Is(err, sql.ErrNoRows) {
-			apiFail(w, http.StatusNotFound, map[string]string{"ticket": "not_found"})
+		if err == sql.ErrNoRows {
+			apiFail(w, http.StatusNotFound, map[string]string{
+				"ticket": "ticket not found",
+			})
 			return
 		}
 		if err != nil {
-			apiFail(w, http.StatusInternalServerError, map[string]string{"general": "invalid"})
+			apiFail(w, http.StatusInternalServerError, map[string]string{
+				"database": err.Error(),
+			})
 			return
 		}
 
-		if desc.Valid {
-			v := desc.String
-			t.DetailedDesc = &v
-		}
-		if handled.Valid {
-			v := handled.Int64
-			t.HandledByUserID = &v
-		}
-		if tout.Valid {
-			v := tout.Time
-			t.TicketTimeOut = &v
-		}
-		if first.Valid {
-			v := first.Time
-			t.FirstResponseAt = &v
-		}
-
-		apiOK(w, map[string]any{"ticket": t})
-	}
+		apiOK(w, map[string]any{
+			"ticket": ticket,
+		})
+	})
 }
 
-type resolveTicketRequest struct {
-	TicketID string `json:"ticket_id"`
-}
-
-// PATCH /ticket/resolve  (by ticket_id)
-// Body: {"ticket_id":"TCK-0001"}
-func ResolveTicketHandler(db *sql.DB) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPatch {
-			apiFail(w, http.StatusMethodNotAllowed, map[string]string{"method": "invalid"})
+func ResolveTicketHandler(db *sql.DB) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			apiFail(w, http.StatusMethodNotAllowed, map[string]string{
+				"method": "method not allowed",
+			})
 			return
 		}
 
-		var req resolveTicketRequest
+		var req dto.ResolveTicketRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			apiFail(w, http.StatusBadRequest, map[string]string{"body": "invalid"})
+			apiFail(w, http.StatusBadRequest, map[string]string{
+				"body": "invalid json body",
+			})
 			return
 		}
 
-		req.TicketID = strings.TrimSpace(req.TicketID)
-		if req.TicketID == "" {
-			apiFail(w, http.StatusBadRequest, map[string]string{"ticket_id": "required"})
+		if strings.TrimSpace(req.TicketID) == "" {
+			apiFail(w, http.StatusBadRequest, map[string]string{
+				"ticket_id": "ticket_id is required",
+			})
 			return
 		}
 
-		var updated int64
-		err := db.QueryRow(`
+		query := `
 			UPDATE tickets
-			SET auto_resolved = TRUE
+			SET updated_at = NOW()
 			WHERE ticket_id = $1
-			RETURNING id
-		`, req.TicketID).Scan(&updated)
+			RETURNING
+				id,
+				ticket_id,
+				title,
+				type,
+				severity,
+				source,
+				is_escalated,
+				auto_resolved,
+				detailed_description,
+				created_by_user_id,
+				handled_by_user_id,
+				ticket_time_in,
+				first_response_at,
+				ticket_time_out,
+				created_at,
+				updated_at
+		`
 
-		if errors.Is(err, sql.ErrNoRows) {
-			apiFail(w, http.StatusNotFound, map[string]string{"ticket": "not_found"})
+		var ticket dto.TicketResponse
+
+		err := db.QueryRow(query, req.TicketID).Scan(
+			&ticket.ID,
+			&ticket.TicketID,
+			&ticket.Title,
+			&ticket.Type,
+			&ticket.Severity,
+			&ticket.Source,
+			&ticket.IsEscalated,
+			&ticket.AutoResolved,
+			&ticket.DetailedDescription,
+			&ticket.CreatedByUserID,
+			&ticket.HandledByUserID,
+			&ticket.TicketTimeIn,
+			&ticket.FirstResponseAt,
+			&ticket.TicketTimeOut,
+			&ticket.CreatedAt,
+			&ticket.UpdatedAt,
+		)
+		if err == sql.ErrNoRows {
+			apiFail(w, http.StatusNotFound, map[string]string{
+				"ticket": "ticket not found",
+			})
 			return
 		}
 		if err != nil {
-			apiFail(w, http.StatusInternalServerError, map[string]string{"general": "invalid"})
+			apiFail(w, http.StatusInternalServerError, map[string]string{
+				"database": err.Error(),
+			})
 			return
 		}
 
-		apiOK(w, map[string]any{"resolved": true})
-	}
+		apiOK(w, map[string]any{
+			"ticket": ticket,
+		})
+	})
 }
